@@ -1,20 +1,24 @@
 # armadillo_app.py — Clean full script (syntax-checked)
 # ---------------------------------------------------------------
 # Features
-# - Landing page (name + tagline), tasteful backgrounds
-# - Auth (login / signup / forgot), role-based routing (client/admin)
+# - Landing page (name + tagline centered), About/Services/Contact sections
+# - Auth (login / signup / forgot with OTP), role-based routing (client/admin)
 # - Client dashboards (Procurement, Inventory, Logistics) with KPI cards,
-#   inline slicers under the title, charts, and print button
+#   sidebar slicers (Amazon-style), charts, print + export-to-PDF (charts + KPIs)
 # - Admin: Dashboards (view any client) & Backend with:
 #     1) Create/Edit Clients (+ assign users to client)
 #     2) Add/Edit/Remove Data (upload CSV/XLSX, clean, inline edit, save, load existing)
-#     3) Select KPIs (predefined + custom builder per domain)
+#     3) KPI (per-domain subtabs) with:
+#         - Calculated columns (formula builder)
+#         - Measures (expression builder)
+#         - Data preview for each domain
 # - SQLite persistence; bcrypt password hashing
 # - Client view hides tables (toggle to view); Admin sees table by default
 # - Uses only st.query_params (no experimental APIs)
 # ---------------------------------------------------------------
-# Run: pip install streamlit pandas plotly bcrypt SQLAlchemy openpyxl xlsxwriter
-# Start: streamlit run armadillo_app.py
+# Run:
+#   pip install streamlit pandas plotly sqlalchemy bcrypt openpyxl xlsxwriter kaleido reportlab
+#   streamlit run armadillo_app.py
 
 import os
 import json
@@ -118,7 +122,6 @@ def init_db() -> None:
             )
             """
         ))
-    with engine.begin() as con:
         con.execute(text(
             """
             CREATE TABLE IF NOT EXISTS pw_otps (
@@ -285,8 +288,8 @@ def set_bg(style_key: str) -> None:
             border-radius: 16px;
             padding: 24px;
         }}
-        .hero-title {{ font-size: 64px; font-weight: 800; letter-spacing: 0.5px; }}
-        .hero-sub {{ font-size: 22px; opacity: 0.9; }}
+        .hero-title {{ font-size: 64px; font-weight: 800; letter-spacing: 0.5px; text-align:center }}
+        .hero-sub {{ font-size: 22px; opacity: 0.9; text-align:center }}
         @media print {{
             header, footer, .stSidebar {{ display: none !important; }}
             .stApp {{ background: white !important; color: #000 !important; }}
@@ -318,53 +321,57 @@ def reset_filters(key_prefix: str):
             del st.session_state[k]
     st.rerun()
 
-def slicers_inline(df: pd.DataFrame, key_prefix: str = "global") -> dict:
-    st.markdown("#### 🔎 Filters")
-    row = st.columns([2, 2, 2, 2])
+def slicers_sidebar(df: pd.DataFrame, key_prefix: str = "global") -> dict:
+    """Amazon-like sidebar filters with expanders and non-overlapping dropdowns."""
+    st.sidebar.header("Filters")
     filters: dict = {}
-    i = 0
-    if "received_date" in df.columns:
-        dmin = pd.to_datetime(df["received_date"], errors="coerce").min()
-        dmax = pd.to_datetime(df["received_date"], errors="coerce").max()
-        with row[i]:
+
+    # Date expander (uses received_date where available)
+    with st.sidebar.expander("Date", expanded=True):
+        date_col = None
+        for candidate in ["received_date", "dispatch_date", "delivery_date", "month", "order_date"]:
+            if candidate in df.columns:
+                date_col = candidate
+                break
+        if date_col:
+            dseries = pd.to_datetime(df[date_col], errors="coerce")
+            dmin, dmax = dseries.min(), dseries.max()
             d_from, d_to = st.date_input(
-                "Date range",
+                "Range",
                 value=(dmin.date() if pd.notna(dmin) else date.today(),
                        dmax.date() if pd.notna(dmax) else date.today()),
                 key=f"{key_prefix}_date",
             )
-        filters["date"] = (pd.to_datetime(d_from), pd.to_datetime(d_to))
-        i += 1
-    if "supplier" in df.columns:
-        sups = sorted([s for s in df["supplier"].dropna().unique().tolist()])
-        with row[i % 4]:
-            sel = st.multiselect("Supplier", sups, default=sups, key=f"{key_prefix}_supplier")
-        filters["supplier"] = sel
-        i += 1
-    if "sku" in df.columns:
-        skus = sorted([s for s in df["sku"].dropna().unique().tolist()])
-        with row[i % 4]:
-            sel2 = st.multiselect("SKU", skus, default=skus, key=f"{key_prefix}_sku")
-        filters["sku"] = sel2
-        i += 1
-    if "mode" in df.columns:
-        modes = sorted(df["mode"].dropna().unique().tolist())
-        with row[i % 4]:
-            sel3 = st.multiselect("Mode", modes, default=modes, key=f"{key_prefix}_mode")
-        filters["mode"] = sel3
+            filters["date"] = (pd.to_datetime(d_from), pd.to_datetime(d_to), date_col)
 
-    rr = st.columns([3,1,1,1])
-    with rr[1]:
-        if st.button("↺ Reset Filters", key=f"{key_prefix}_reset"):
-            reset_filters(key_prefix)
+    with st.sidebar.expander("Supplier", expanded=False):
+        if "supplier" in df.columns:
+            sups = sorted(df["supplier"].dropna().unique().tolist())
+            sel = st.multiselect("Supplier", sups, default=sups, key=f"{key_prefix}_supplier")
+            filters["supplier"] = sel
+
+    with st.sidebar.expander("SKU", expanded=False):
+        if "sku" in df.columns:
+            skus = sorted(df["sku"].dropna().unique().tolist())
+            sel = st.multiselect("SKU", skus, default=skus, key=f"{key_prefix}_sku")
+            filters["sku"] = sel
+
+    with st.sidebar.expander("Mode", expanded=False):
+        if "mode" in df.columns:
+            modes = sorted(df["mode"].dropna().unique().tolist())
+            sel = st.multiselect("Mode", modes, default=modes, key=f"{key_prefix}_mode")
+            filters["mode"] = sel
+
+    st.sidebar.button("↺ Reset Filters", key=f"{key_prefix}_reset", on_click=lambda: reset_filters(key_prefix))
     return filters
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     ctx = df.copy()
-    if "date" in filters and "received_date" in ctx.columns:
-        d_from, d_to = filters["date"]
-        ctx = ctx[(pd.to_datetime(ctx["received_date"], errors="coerce") >= d_from) &
-                  (pd.to_datetime(ctx["received_date"], errors="coerce") <= d_to)]
+    if "date" in filters:
+        d_from, d_to, date_col = filters["date"]
+        if date_col in ctx.columns:
+            ctx = ctx[(pd.to_datetime(ctx[date_col], errors="coerce") >= d_from) &
+                      (pd.to_datetime(ctx[date_col], errors="coerce") <= d_to)]
     for col in ["supplier", "sku", "mode"]:
         if col in filters and col in ctx.columns and filters.get(col):
             ctx = ctx[ctx[col].isin(filters[col])]
@@ -384,7 +391,27 @@ def kpi_cards(domain: str, df: pd.DataFrame, kpis: list) -> None:
 
     vals: list[tuple[str, str]] = []
     for k in (kpis or [])[:3]:
-        if isinstance(k, dict):
+        if isinstance(k, dict) and k.get("type") == "measure":
+            # (Very) simple measure renderer: evaluate agg-style expressions
+            expr = (k.get("expr") or "").strip()
+            name = k.get("name") or "Measure"
+            try:
+                # basic safe scope: sums / means
+                scope = {col: pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series(dtype=float)
+                         for col in df.columns}
+                scope.update({
+                    "sum": lambda x: float(pd.to_numeric(x, errors="coerce").sum()),
+                    "mean": lambda x: float(pd.to_numeric(x, errors="coerce").mean()),
+                    "count": lambda x: int(pd.to_numeric(x, errors="coerce").count()),
+                })
+                val = eval(expr, {"__builtins__": {}}, scope)
+                if isinstance(val, float):
+                    vals.append((name, f"{val:,.2f}"))
+                else:
+                    vals.append((name, str(val)))
+            except Exception:
+                vals.append((name, "—"))
+        elif isinstance(k, dict):
             col = k.get("column"); agg = k.get("agg", "sum"); name = k.get("name", f"{agg} {col}")
             if col in df.columns:
                 series = pd.to_numeric(df[col], errors="coerce") if pd.api.types.is_numeric_dtype(df[col]) else df[col]
@@ -419,23 +446,28 @@ def page_landing() -> None:
     set_bg("landing")
     logout_button()
 
-    top = st.columns([4, 1])
-    with top[0]:
-        st.markdown(f"<div class='hero-title'>{APP_NAME}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='hero-sub'>{TAGLINE}</div>", unsafe_allow_html=True)
-        st.markdown(
-            """
-            <div class='glass'>
-            <p>Welcome to <strong>Armadillo</strong> — a strategic consulting platform for SMBs.
-            Build Power BI–style dashboards for <em>Procurement</em>, <em>Inventory</em>, and <em>Logistics</em>,
-            complete with slicers, printable layouts, and an admin backend to onboard clients and clean data.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with top[1]:
-        st.write("")
-        st.write("")
+    st.markdown(f"<div class='hero-title'>{APP_NAME}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='hero-sub'>{TAGLINE}</div>", unsafe_allow_html=True)
+
+    st.write("")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.image("https://images.unsplash.com/photo-1551836022-d5d88e9218df?w=800", use_column_width=True)
+        st.markdown("### About Us")
+        st.write("We help SMBs turn raw data into strategic insight across procurement, inventory, and logistics.")
+    with c2:
+        st.image("https://images.unsplash.com/photo-1551836022-4c4c79ecde0c?w=800", use_column_width=True)
+        st.markdown("### Services")
+        st.write("Dashboards, KPI architecture, data engineering, process improvement, and CxO-ready reporting.")
+    with c3:
+        st.image("https://images.unsplash.com/photo-1492724441997-5dc865305da7?w=800", use_column_width=True)
+        st.markdown("### Contact Us")
+        st.write("Email: hello@armadillo.io  ")
+        st.write("Phone: +1 (555) 123-4567")
+
+    st.write("")
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
         if st.button("🔐 Login", key="landing_login", use_container_width=True):
             nav("login"); st.rerun()
 
@@ -515,28 +547,57 @@ def page_login() -> None:
 # ----------------------------- PDF Export Helper -----------------------------
 
 def export_pdf_for_dashboard(client_id: int, domain: str, ctx: pd.DataFrame, kpis: list) -> str:
-    fig = None
-    img_path = None
+    """
+    Builds a multi-chart PDF: KPIs + up to 2 domain charts.
+    Requires: pip install kaleido reportlab
+    """
+    figs = []
+
     try:
         if domain == "procurement" and {"received_date","on_time"} <= set(ctx.columns):
             tmp = ctx.copy()
             tmp["month"] = pd.to_datetime(tmp["received_date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
             df_plot = tmp.groupby("month", as_index=False)["on_time"].mean()
-            fig = px.line(df_plot, x="month", y="on_time", title="OTD by Month", markers=True)
-        elif domain == "inventory" and {"month","closing_qty"} <= set(ctx.columns):
+            figs.append(px.line(df_plot, x="month", y="on_time",
+                                title="On-Time Delivery by Month",
+                                labels={"month":"Month","on_time":"On Time Delivery"}))
+        if domain == "procurement" and {"supplier","ppv_amt"} <= set(ctx.columns):
+            top = ctx.groupby("supplier", as_index=False)["ppv_amt"].sum().sort_values("ppv_amt", ascending=False).head(10)
+            figs.append(px.bar(top, x="supplier", y="ppv_amt",
+                               title="Top Suppliers by PPV",
+                               labels={"supplier":"Supplier","ppv_amt":"PPV Amount ($)"}))
+
+        if domain == "inventory" and {"month","closing_qty"} <= set(ctx.columns):
             df_plot = ctx.groupby("month", as_index=False)["closing_qty"].sum()
-            fig = px.line(df_plot, x="month", y="closing_qty", title="Closing Qty Trend", markers=True)
-        elif domain == "logistics" and {"dispatch_date","freight_cost"} <= set(ctx.columns):
+            figs.append(px.line(df_plot, x="month", y="closing_qty",
+                                title="Closing Quantity Trend",
+                                labels={"month":"Month","closing_qty":"Closing Quantity"}))
+
+        if domain == "logistics" and {"dispatch_date","freight_cost"} <= set(ctx.columns):
             tmp = ctx.copy()
             tmp["month"] = pd.to_datetime(tmp["dispatch_date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
             df_plot = tmp.groupby("month", as_index=False)["freight_cost"].mean()
-            fig = px.line(df_plot, x="month", y="freight_cost", title="Freight Cost Trend", markers=True)
-        if fig is not None:
-            img_path = f"/tmp/{domain}_{client_id}_chart.png"
-            fig.write_image(img_path, scale=2)  # needs kaleido
+            figs.append(px.line(df_plot, x="month", y="freight_cost",
+                                title="Freight Cost Trend",
+                                labels={"month":"Month","freight_cost":"Freight Cost"}))
+        if domain == "logistics" and "mode" in ctx.columns:
+            figs.append(px.pie(ctx, names="mode",
+                               title="Mode Split (Air/Sea/Ground)",
+                               labels={"mode":"Mode"}))
     except Exception:
-        img_path = None
+        pass
 
+    # Write chart images
+    img_paths = []
+    for i, fig in enumerate(figs):
+        try:
+            pth = f"/tmp/{domain}_{client_id}_chart_{i}.png"
+            fig.write_image(pth, scale=2)  # kaleido
+            img_paths.append(pth)
+        except Exception:
+            continue
+
+    # Build PDF
     pdf_path = f"/tmp/armadillo_{domain}_{client_id}.pdf"
     c = pdfcanvas.Canvas(pdf_path, pagesize=A4)
     width, height = A4
@@ -547,28 +608,29 @@ def export_pdf_for_dashboard(client_id: int, domain: str, ctx: pd.DataFrame, kpi
     y -= 1*cm
 
     c.setFont("Helvetica", 12)
-    kpi_lines = []
-    if "on_time" in ctx.columns and any("otd" in str(k).lower() for k in kpis):
-        kpi_lines.append(f"Supplier OTD: {ctx['on_time'].mean():.1%}")
-    if "ppv_amt" in ctx.columns and any("ppv" in str(k).lower() for k in kpis):
-        kpi_lines.append(f"PPV: ${ctx['ppv_amt'].sum():,.0f}")
-    if {"freight_cost","weight_kg"} <= set(ctx.columns) and any("freight" in str(k).lower() for k in kpis):
+    lines = []
+    if "on_time" in ctx.columns:
+        lines.append(f"On Time Delivery: {ctx['on_time'].mean():.1%}")
+    if "ppv_amt" in ctx.columns:
+        lines.append(f"PPV Total: ${ctx['ppv_amt'].sum():,.0f}")
+    if {"freight_cost","weight_kg"} <= set(ctx.columns):
         per = ctx["freight_cost"].sum() / ctx["weight_kg"].sum() if ctx["weight_kg"].sum() else 0
-        kpi_lines.append(f"Freight/Unit: ${per:,.2f}/kg")
-    if "closing_qty" in ctx.columns and any("closing" in str(k).lower() for k in kpis):
-        kpi_lines.append(f"Total Closing Qty: {ctx['closing_qty'].sum():,.0f}")
+        lines.append(f"Freight/Unit: ${per:,.2f}/kg")
+    if "closing_qty" in ctx.columns:
+        lines.append(f"Closing Quantity: {ctx['closing_qty'].sum():,.0f}")
 
-    for line in (kpi_lines[:3] or [""]):
-        c.drawString(2*cm, y, line)
-        y -= 0.7*cm
+    for line in lines[:4]:
+        c.drawString(2*cm, y, line); y -= 0.7*cm
 
-    if img_path and os.path.exists(img_path):
+    for p in img_paths:
+        if y < 6*cm:
+            c.showPage(); y = height - 2*cm
         img_w = width - 4*cm
         img_h = 9*cm
-        c.drawImage(img_path, 2*cm, y - img_h, width=img_w, height=img_h, preserveAspectRatio=True, anchor='sw')
+        c.drawImage(p, 2*cm, y - img_h, width=img_w, height=img_h, preserveAspectRatio=True, anchor='sw')
         y -= img_h + 1*cm
-    c.showPage()
-    c.save()
+
+    c.showPage(); c.save()
     return pdf_path
 
 # ----------------------------- Dashboards -----------------------------
@@ -596,13 +658,14 @@ def dashboard_section(title: str, client_id: int, domain: str) -> None:
     if st.button("🖨️ Print Dashboard", key=f"print_{domain}_{client_id}"):
         components.html("<script>window.print()</script>", height=0)
 
-    # Inline filters
-    filters = slicers_inline(df, key_prefix=f"{domain}_{client_id}")
+    # Sidebar slicers (Amazon-style)
+    filters = slicers_sidebar(df, key_prefix=f"{domain}_{client_id}")
     ctx = apply_filters(df, filters)
 
+    # KPI cards
     kpi_cards(domain, ctx, kpis)
 
-    # Export PDF button
+    # Export PDF
     pdf_col = st.columns([1,5])[0]
     with pdf_col:
         if st.button("⬇️ Export to PDF", key=f"export_pdf_{domain}_{client_id}"):
@@ -620,13 +683,21 @@ def dashboard_section(title: str, client_id: int, domain: str) -> None:
             if {"received_date", "on_time"} <= set(ctx.columns):
                 ctx["month"] = pd.to_datetime(ctx["received_date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
                 chart_df = ctx.groupby("month", as_index=False).agg(otd=("on_time", "mean"))
-                st.plotly_chart(px.line(chart_df, x="month", y="otd", markers=True, title="On-Time Delivery by Month"), use_container_width=True)
+                st.plotly_chart(
+                    px.line(chart_df, x="month", y="otd", markers=True,
+                            title="On-Time Delivery by Month",
+                            labels={"month":"Month","otd":"On Time Delivery"}),
+                    use_container_width=True)
             else:
                 st.info("Add received_date & on_time columns for OTD chart.")
         with c2:
             if {"supplier", "ppv_amt"} <= set(ctx.columns):
                 top = ctx.groupby("supplier", as_index=False)["ppv_amt"].sum().sort_values("ppv_amt", ascending=False)
-                st.plotly_chart(px.bar(top.head(10), x="supplier", y="ppv_amt", title="Top Suppliers by PPV"), use_container_width=True)
+                st.plotly_chart(
+                    px.bar(top.head(10), x="supplier", y="ppv_amt",
+                           title="Top Suppliers by PPV",
+                           labels={"supplier":"Supplier","ppv_amt":"PPV Amount ($)"}),
+                    use_container_width=True)
             else:
                 st.info("Add supplier & ppv_amt columns for PPV chart.")
 
@@ -634,15 +705,24 @@ def dashboard_section(title: str, client_id: int, domain: str) -> None:
         with c1:
             if "month" in ctx.columns and "closing_qty" in ctx.columns:
                 df_plot = ctx.groupby("month", as_index=False)["closing_qty"].sum()
-                st.plotly_chart(px.line(df_plot, x="month", y="closing_qty", title="Closing Quantity Trend", markers=True), use_container_width=True)
+                st.plotly_chart(
+                    px.line(df_plot, x="month", y="closing_qty", title="Closing Quantity Trend", markers=True,
+                            labels={"month":"Month","closing_qty":"Closing Quantity"}),
+                    use_container_width=True)
             else:
                 st.info("Add month & closing_qty columns for trend chart.")
         with c2:
             if "category" in ctx.columns and "closing_qty" in ctx.columns:
-                st.plotly_chart(px.pie(ctx, names="category", values="closing_qty", title="Category Mix"), use_container_width=True)
+                st.plotly_chart(
+                    px.pie(ctx, names="category", values="closing_qty", title="Category Mix",
+                           labels={"category":"Category","closing_qty":"Closing Quantity"}),
+                    use_container_width=True)
             elif "warehouse" in ctx.columns and "closing_qty" in ctx.columns:
                 wh = ctx.groupby("warehouse", as_index=False)["closing_qty"].sum()
-                st.plotly_chart(px.bar(wh, x="warehouse", y="closing_qty", title="Warehouse Stock"), use_container_width=True)
+                st.plotly_chart(
+                    px.bar(wh, x="warehouse", y="closing_qty", title="Warehouse Stock",
+                           labels={"warehouse":"Warehouse","closing_qty":"Closing Quantity"}),
+                    use_container_width=True)
             else:
                 st.info("Add category or warehouse columns for mix chart.")
 
@@ -651,15 +731,24 @@ def dashboard_section(title: str, client_id: int, domain: str) -> None:
             if {"dispatch_date", "freight_cost"} <= set(ctx.columns):
                 ctx["month"] = pd.to_datetime(ctx["dispatch_date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
                 df_plot = ctx.groupby("month", as_index=False)["freight_cost"].mean()
-                st.plotly_chart(px.line(df_plot, x="month", y="freight_cost", title="Freight Cost Trend", markers=True), use_container_width=True)
+                st.plotly_chart(
+                    px.line(df_plot, x="month", y="freight_cost", title="Freight Cost Trend", markers=True,
+                            labels={"month":"Month","freight_cost":"Freight Cost"}),
+                    use_container_width=True)
             else:
                 st.info("Add dispatch_date & freight_cost columns for trend chart.")
         with c2:
             if "mode" in ctx.columns:
-                st.plotly_chart(px.pie(ctx, names="mode", title="Mode Split (Air/Sea/Ground)"), use_container_width=True)
+                st.plotly_chart(
+                    px.pie(ctx, names="mode", title="Mode Split (Air/Sea/Ground)",
+                           labels={"mode":"Mode"}),
+                    use_container_width=True)
             elif "carrier" in ctx.columns:
                 perf = ctx.groupby("carrier", as_index=False)[["damage_flag", "complete_flag"]].mean(numeric_only=True)
-                st.plotly_chart(px.bar(perf, x="carrier", y="complete_flag", title="Carrier Perfect Delivery %"), use_container_width=True)
+                st.plotly_chart(
+                    px.bar(perf, x="carrier", y="complete_flag", title="Carrier Perfect Delivery %",
+                           labels={"carrier":"Carrier","complete_flag":"Perfect Delivery %"}),
+                    use_container_width=True)
             else:
                 st.info("Add mode or carrier columns for logistics chart.")
 
@@ -691,7 +780,12 @@ def page_client_home() -> None:
         st.info("No client linked to this account yet.")
         return
 
-    st.markdown("## Client Dashboard")
+    # Show client name at top
+    with engine.begin() as con:
+        row = con.execute(text("SELECT name FROM clients WHERE id=:i"), {"i": cid}).fetchone()
+    cname = row[0] if row else "Client"
+    st.markdown(f"## {cname} — Dashboards")
+
     tabs = st.tabs(["Procurement", "Inventory", "Logistics"])
     with tabs[0]:
         dashboard_section("Procurement Dashboard", cid, "procurement")
@@ -719,7 +813,7 @@ def admin_dashboards() -> None:
 
 def admin_backend() -> None:
     st.markdown("### Backend")
-    t1, t2, t3 = st.tabs(["1) Create/Edit Clients", "2) Add/Edit/Remove Data", "3) Select KPIs"])
+    t1, t2, t3 = st.tabs(["1) Create/Edit Clients", "2) Add/Edit/Remove Data", "3) KPI"])
 
     # --- Step 1: Create/Edit Clients ---
     with t1:
@@ -796,7 +890,7 @@ def admin_backend() -> None:
                 else:
                     save_dataset(cid2, domain, edited)
                     st.success("Data saved.")
-                    st.info("Proceed to Step 3 to select KPIs.")
+                    st.info("Proceed to Step 3 to configure KPIs.")
                     st.query_params.update({"page": "admin_home", "step": "kpis", "cid": str(cid2), "domain": domain})
         else:
             st.info("Upload a CSV/Excel to begin cleaning.")
@@ -812,45 +906,76 @@ def admin_backend() -> None:
                     save_dataset(cid2, domain, edited2)
                     st.success("Existing data updated.")
 
-    # --- Step 3: Select KPIs ---
+    # --- Step 3: KPI (per-domain subtabs, calculated columns, measures) ---
     with t3:
-        st.subheader("Select KPIs per Tab")
+        st.subheader("KPI")
         clients = list_clients()
         cid3 = st.selectbox("Client", options=[c[0] for c in clients] if clients else [None],
                             format_func=lambda x: dict(clients).get(x, "—") if x else "—",
                             key="kpi_client")
-        for dmn in ["procurement", "inventory", "logistics"]:
-            with st.expander(f"KPIs for {dmn.title()}"):
-                defaults = load_kpis(cid3, dmn) if cid3 else DEFAULT_KPIS[dmn]
-                base = [k for k in defaults if isinstance(k, str)]
-                custom_existing = [k for k in defaults if isinstance(k, dict)]
-                chosen = st.multiselect("Choose KPIs", options=DEFAULT_KPIS[dmn], default=base, key=f"kpi_{dmn}")
 
-                st.markdown("**Add Custom KPI**")
-                data = load_dataset(cid3, dmn) if cid3 else None
-                numeric_cols = [c for c in (data.columns.tolist() if data is not None else []) if (data is not None and pd.api.types.is_numeric_dtype(data[c]))]
-                c1, c2, c3cols = st.columns([2, 1, 1])
-                with c1:
-                    kpi_name = st.text_input("KPI Name", key=f"custom_name_{dmn}")
-                with c2:
-                    kpi_col = st.selectbox("Column", options=numeric_cols, key=f"custom_col_{dmn}")
-                with c3cols:
-                    kpi_agg = st.selectbox("Aggregation", options=["sum", "mean", "min", "max", "count"], key=f"custom_agg_{dmn}")
+        tab_p, tab_i, tab_l = st.tabs(["Procurement", "Inventory", "Logistics"])
 
-                if st.button(f"➕ Add Custom KPI", key=f"add_custom_{dmn}"):
-                    if kpi_name and kpi_col:
-                        custom_existing.append({"name": kpi_name, "column": kpi_col, "agg": kpi_agg})
-                        st.success("Custom KPI added (remember to Save KPIs).")
-                    else:
-                        st.error("Provide a name and select a column.")
+        def kpi_builder(domain_key: str):
+            st.markdown("#### Dataset Preview")
+            data = load_dataset(cid3, domain_key) if cid3 else None
+            if data is None or data.empty:
+                st.info("No data uploaded yet for this domain.")
+                return
+            st.dataframe(data, use_container_width=True, height=280)
 
-                if st.button(f"Save {dmn.title()} KPIs", key=f"save_{dmn}_kpis"):
-                    if cid3:
-                        final_kpis = chosen + custom_existing
-                        save_kpis(cid3, dmn, final_kpis)
-                        st.success(f"Saved KPIs for {dmn}.")
-                    else:
-                        st.error("Select a client first.")
+            # Display KPIs (predefined)
+            st.markdown("#### Display KPIs")
+            defaults = load_kpis(cid3, domain_key) if cid3 else DEFAULT_KPIS[domain_key]
+            base = [k for k in defaults if isinstance(k, str)]
+            custom_existing = [k for k in defaults if isinstance(k, dict)]
+            chosen = st.multiselect("Choose KPIs", options=DEFAULT_KPIS[domain_key], default=base, key=f"kpi_{domain_key}")
+
+            # Calculated columns (formula)
+            st.markdown("#### Calculated Columns")
+            cc1, cc2 = st.columns([2,3])
+            with cc1:
+                new_col = st.text_input("New column name", key=f"calc_name_{domain_key}")
+            with cc2:
+                expr = st.text_input("Formula (e.g., act_cost*qty - std_cost*qty)", key=f"calc_expr_{domain_key}")
+            if st.button("Add Column", key=f"add_col_{domain_key}"):
+                try:
+                    tmp = data.copy()
+                    local = {c: tmp[c] for c in tmp.columns}
+                    tmp[new_col] = pd.eval(expr, engine='python', parser='pandas', local_dict=local)
+                    save_dataset(cid3, domain_key, tmp)
+                    custom_existing.append({"name": new_col, "column": new_col, "agg": "sum"})
+                    st.success(f"Column '{new_col}' added and saved.")
+                except Exception as e:
+                    st.error(f"Error in formula: {e}")
+
+            # Measures
+            st.markdown("#### Measures")
+            m1, m2, m3 = st.columns([2,2,2])
+            with m1:
+                m_name = st.text_input("Measure name", key=f"meas_name_{domain_key}")
+            with m2:
+                m_expr = st.text_input("Measure formula (e.g., sum(ppv_amt)/sum(qty))", key=f"meas_expr_{domain_key}")
+            with m3:
+                st.markdown("&nbsp;")
+                if st.button("Add Measure", key=f"add_meas_{domain_key}"):
+                    custom_existing.append({"name": m_name, "expr": m_expr, "type": "measure"})
+                    st.success("Measure added (remember to Save KPIs).")
+
+            if st.button(f"Save {domain_key.title()} KPIs", key=f"save_{domain_key}_kpis"):
+                if cid3:
+                    final_kpis = chosen + custom_existing
+                    save_kpis(cid3, domain_key, final_kpis)
+                    st.success(f"Saved KPIs for {domain_key}.")
+                else:
+                    st.error("Select a client first.")
+
+        with tab_p:
+            kpi_builder("procurement")
+        with tab_i:
+            kpi_builder("inventory")
+        with tab_l:
+            kpi_builder("logistics")
 
 
 def page_admin_home() -> None:
