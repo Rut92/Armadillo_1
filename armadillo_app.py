@@ -229,8 +229,9 @@ def send_email_otp(to_email: str, code: str) -> bool:
         msg["Subject"] = "Armadillo Password Reset Code"
         msg["From"] = sender
         msg["To"] = to_email
-        msg.set_content(f"Your Armadillo reset code is: {code}
-This code expires in 10 minutes.")
+        msg.set_content(
+            f"Your Armadillo reset code is: {code}\nThis code expires in 10 minutes."
+        )
         with smtplib.SMTP(host, port) as s:
             s.starttls()
             s.login(user, pw)
