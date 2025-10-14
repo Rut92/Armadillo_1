@@ -28,6 +28,32 @@ import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, text
 
+# Put this right after your imports at the top of armadillo_app.py
+import importlib, sys, streamlit as st
+
+REQUIRED = [
+    ("streamlit", None),
+    ("pandas", None),
+    ("plotly", "express"),       # plotly.express used
+    ("sqlalchemy", None),
+    ("bcrypt", None),
+    ("openpyxl", None),
+    ("xlsxwriter", None),
+]
+
+missing = []
+for pkg, sub in REQUIRED:
+    try:
+        importlib.import_module(f"{pkg}.{sub}" if sub else pkg)
+    except Exception as e:
+        missing.append((pkg, str(e)))
+
+if missing:
+    st.error("🚨 Missing or broken dependencies detected:")
+    for pkg, err in missing:
+        st.write(f"- **{pkg}** → `{err}`")
+    st.stop()
+
 # ----------------------------- App Config -----------------------------
 st.set_page_config(page_title="Armadillo", page_icon="🦔", layout="wide")
 
