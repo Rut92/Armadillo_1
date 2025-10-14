@@ -1,13 +1,14 @@
-# Armadillo — Streamlit Single‑File MVP
+# armadillo_app.py
+# Armadillo — Streamlit Single-File MVP (corrected full script)
 # ---------------------------------------------------------------
 # Features
 # - Landing page with name + tagline, aesthetic backgrounds
 # - Auth (login / sign up / forgot password), role-based routing (client/admin)
 # - Client dashboard: 3 tabs (Procurement, Inventory, Logistics) with KPI cards,
-#   charts, slicers, print-friendly layout
+#   charts, slicers (unique keys), print-friendly layout
 # - Admin area: Dashboards (view all clients) & Backend tabs
 #   1) Create/Edit Clients (assign client email)
-#   2) Add/Edit/Remove Data (CSV/Excel upload → clean → inline edit)
+#   2) Add/Edit/Remove Data (CSV/Excel upload → clean → inline edit → save)
 #   3) Select KPIs per tab → used by client dashboards
 # - Persistent storage in SQLite; passwords hashed (bcrypt)
 # - Save-as-you-go: partial progress persists; incomplete dashboards show messages
@@ -36,7 +37,7 @@ TAGLINE = "Strategic Insights. Operational Clarity."
 DB_PATH = os.environ.get("ARMADILLO_DB", "armadillo.db")
 engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
 
-# Default KPI options per tab (you can extend later)
+# Default KPI options per tab (extend later)
 DEFAULT_KPIS = {
     "procurement": ["Supplier OTD %", "PPV $", "PO Cycle Time (days)"],
     "inventory": ["Inventory Turns", "DOH", "Obsolete %"],
@@ -104,7 +105,6 @@ def init_db():
                 "INSERT INTO users(email,password_hash,role,created_at) VALUES(:e,:p,'admin',:c)"
             ), {"e": "admin@armadillo.io", "p": pw, "c": datetime.utcnow().isoformat()})
 
-
 # ----------------------------- Auth Helpers -----------------------------
 def hash_pw(pw: str) -> bytes:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
@@ -115,12 +115,10 @@ def check_pw(pw: str, hashed: bytes) -> bool:
     except Exception:
         return False
 
-
 def get_user_by_email(email: str):
     with engine.begin() as con:
         row = con.execute(text("SELECT * FROM users WHERE email=:e"), {"e": email}).mappings().fetchone()
         return dict(row) if row else None
-
 
 def create_user(email: str, pw: str, role: str = "client", client_id: int | None = None):
     with engine.begin() as con:
@@ -128,8 +126,9 @@ def create_user(email: str, pw: str, role: str = "client", client_id: int | None
             "INSERT INTO users(email,password_hash,role,client_id,created_at) VALUES(:e,:p,:r,:cid,:c)"
         ), {"e": email, "p": hash_pw(pw), "r": role, "cid": client_id, "c": datetime.utcnow().isoformat()})
 
-
 def upsert_client(name: str, background_notes: str = "") -> int:
+    if not name:
+        return None
     with engine.begin() as con:
         row = con.execute(text("SELECT id FROM clients WHERE name=:n"), {"n": name}).fetchone()
         if row:
@@ -140,17 +139,19 @@ def upsert_client(name: str, background_notes: str = "") -> int:
         rid = con.execute(text("SELECT id FROM clients WHERE name=:n"), {"n": name}).fetchone()[0]
         return rid
 
-
 def list_clients():
     with engine.begin() as con:
         rows = con.execute(text("SELECT id,name FROM clients ORDER BY name")).fetchall()
         return [(r[0], r[1]) for r in rows]
 
-
 def save_dataset(client_id: int, domain: str, df: pd.DataFrame):
+    # Convert datetime columns to ISO strings so JSON serialization works
+    for c in df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
+        df[c] = df[c].astype(str)
     recs = df.to_dict(orient="records")
     with engine.begin() as con:
-        row = con.execute(text("SELECT id FROM datasets WHERE client_id=:c AND domain=:d"), {"c": client_id, "d": domain}).fetchone()
+        row = con.execute(text("SELECT id FROM datasets WHERE client_id=:c AND domain=:d"),
+                          {"c": client_id, "d": domain}).fetchone()
         if row:
             con.execute(text("UPDATE datasets SET data_json=:j, updated_at=:u WHERE id=:i"),
                         {"j": json.dumps(recs), "u": datetime.utcnow().isoformat(), "i": row[0]})
@@ -158,18 +159,18 @@ def save_dataset(client_id: int, domain: str, df: pd.DataFrame):
             con.execute(text("INSERT INTO datasets(client_id,domain,data_json,updated_at) VALUES(:c,:d,:j,:u)"),
                         {"c": client_id, "d": domain, "j": json.dumps(recs), "u": datetime.utcnow().isoformat()})
 
-
 def load_dataset(client_id: int, domain: str) -> pd.DataFrame | None:
     with engine.begin() as con:
-        row = con.execute(text("SELECT data_json FROM datasets WHERE client_id=:c AND domain=:d"), {"c": client_id, "d": domain}).fetchone()
+        row = con.execute(text("SELECT data_json FROM datasets WHERE client_id=:c AND domain=:d"),
+                          {"c": client_id, "d": domain}).fetchone()
         if not row or not row[0]:
             return None
         return pd.DataFrame(json.loads(row[0]))
 
-
 def save_kpis(client_id: int, domain: str, kpis: list[str]):
     with engine.begin() as con:
-        row = con.execute(text("SELECT id FROM kpi_configs WHERE client_id=:c AND domain=:d"), {"c": client_id, "d": domain}).fetchone()
+        row = con.execute(text("SELECT id FROM kpi_configs WHERE client_id=:c AND domain=:d"),
+                          {"c": client_id, "d": domain}).fetchone()
         if row:
             con.execute(text("UPDATE kpi_configs SET kpis_json=:j, updated_at=:u WHERE id=:i"),
                         {"j": json.dumps(kpis), "u": datetime.utcnow().isoformat(), "i": row[0]})
@@ -177,24 +178,22 @@ def save_kpis(client_id: int, domain: str, kpis: list[str]):
             con.execute(text("INSERT INTO kpi_configs(client_id,domain,kpis_json,updated_at) VALUES(:c,:d,:j,:u)"),
                         {"c": client_id, "d": domain, "j": json.dumps(kpis), "u": datetime.utcnow().isoformat()})
 
-
 def load_kpis(client_id: int, domain: str) -> list[str]:
     with engine.begin() as con:
-        row = con.execute(text("SELECT kpis_json FROM kpi_configs WHERE client_id=:c AND domain=:d"), {"c": client_id, "d": domain}).fetchone()
+        row = con.execute(text("SELECT kpis_json FROM kpi_configs WHERE client_id=:c AND domain=:d"),
+                          {"c": client_id, "d": domain}).fetchone()
         if not row or not row[0]:
             return DEFAULT_KPIS.get(domain, [])
         return list(json.loads(row[0]))
 
-
 # ----------------------------- UI Utilities -----------------------------
-
 def set_bg(style_key: str):
     """Apply background CSS by page key."""
     styles = {
         "landing": "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0b1020 100%)",
-        "login": "linear-gradient(135deg, #0b1020 0%, #1b2a41 50%, #0b1020 100%)",
-        "client": "linear-gradient(135deg, #0b1f2a, #0d3b66)",
-        "admin": "linear-gradient(135deg, #1f2937, #111827)",
+        "login":   "linear-gradient(135deg, #0b1020 0%, #1b2a41 50%, #0b1020 100%)",
+        "client":  "linear-gradient(135deg, #0b1f2a, #0d3b66)",
+        "admin":   "linear-gradient(135deg, #1f2937, #111827)",
     }
     st.markdown(
         f"""
@@ -225,30 +224,26 @@ def set_bg(style_key: str):
         unsafe_allow_html=True,
     )
 
-
 def logout_button():
     if st.session_state.get("auth", {}).get("logged_in"):
-        col = st.columns([6,1])[1]
+        col = st.columns([6, 1])[1]
         with col:
-            if st.button("🚪 Log out"):
+            if st.button("🚪 Log out", key="logout_btn"):
                 st.session_state.clear()
-                st.experimental_set_query_params(page="landing")
+                st.query_params["page"] = "landing"
                 st.success("Logged out.")
                 st.rerun()
 
-
 def nav(page: str):
-    st.experimental_set_query_params(page=page)
+    st.query_params["page"] = page
     st.session_state["page"] = page
 
-
 # ----------------------------- Pages -----------------------------
-
 def page_landing():
     set_bg("landing")
     logout_button()  # renders only if logged in
 
-    top = st.columns([4,1])
+    top = st.columns([4, 1])
     with top[0]:
         st.markdown(f"<div class='hero-title'>{APP_NAME}</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='hero-sub'>{TAGLINE}</div>", unsafe_allow_html=True)
@@ -263,10 +258,9 @@ def page_landing():
     with top[1]:
         st.write("")
         st.write("")
-        if st.button("🔐 Login", use_container_width=True):
+        if st.button("🔐 Login", key="landing_login", use_container_width=True):
             nav("login")
             st.rerun()
-
 
 def page_login():
     set_bg("login")
@@ -277,16 +271,15 @@ def page_login():
     tab_login, tab_signup, tab_forgot = st.tabs(["Login", "Sign up", "Forgot password"])
 
     with tab_login:
-        email = st.text_input("Email")
-        pw = st.text_input("Password", type="password")
-        if st.button("Login"):
+        email = st.text_input("Email", key="login_email")
+        pw = st.text_input("Password", type="password", key="login_pw")
+        if st.button("Login", key="login_btn"):
             user = get_user_by_email(email)
             if not user:
                 st.error("No user found with that email.")
             else:
                 if check_pw(pw, user["password_hash"]):
                     st.session_state["auth"] = {"logged_in": True, "user": user}
-                    # route based on role
                     if user["role"] == "admin":
                         nav("admin_home")
                     else:
@@ -297,11 +290,11 @@ def page_login():
 
     with tab_signup:
         st.info("If the email does not exist, create an account (client by default). Admins can later upgrade roles.")
-        email_s = st.text_input("Email (new)")
-        pw1 = st.text_input("Create password", type="password")
-        pw2 = st.text_input("Confirm password", type="password")
-        client_name = st.text_input("Client/Company Name (optional for new client)")
-        if st.button("Create account"):
+        email_s = st.text_input("Email (new)", key="signup_email")
+        pw1 = st.text_input("Create password", type="password", key="signup_pw1")
+        pw2 = st.text_input("Confirm password", type="password", key="signup_pw2")
+        client_name = st.text_input("Client/Company Name (optional for new client)", key="signup_client")
+        if st.button("Create account", key="signup_btn"):
             if pw1 != pw2 or not pw1:
                 st.error("Passwords do not match or are empty.")
             elif get_user_by_email(email_s):
@@ -315,10 +308,10 @@ def page_login():
 
     with tab_forgot:
         st.warning("Demo flow: reset without email token (for PoC). Replace with real email OTP later.")
-        f_email = st.text_input("Registered Email")
-        new_pw1 = st.text_input("New password", type="password")
-        new_pw2 = st.text_input("Confirm new password", type="password")
-        if st.button("Reset password"):
+        f_email = st.text_input("Registered Email", key="forgot_email")
+        new_pw1 = st.text_input("New password", type="password", key="forgot_pw1")
+        new_pw2 = st.text_input("Confirm new password", type="password", key="forgot_pw2")
+        if st.button("Reset password", key="forgot_btn"):
             user = get_user_by_email(f_email)
             if not user:
                 st.error("No user with this email.")
@@ -330,42 +323,43 @@ def page_login():
                                 {"p": hash_pw(new_pw1), "i": user["id"]})
                 st.success("Password updated. Please login.")
 
-
 # ----------------------------- Client Area -----------------------------
-
-def slicers(df: pd.DataFrame):
+def slicers(df: pd.DataFrame, key_prefix: str = "global"):
     st.sidebar.header("🔎 Filters")
     filters = {}
     if "received_date" in df.columns:
-        dmin, dmax = pd.to_datetime(df["received_date"]).min(), pd.to_datetime(df["received_date"]).max()
-        d_from, d_to = st.sidebar.date_input("Date range", value=(dmin.date() if pd.notna(dmin) else date.today(),
-                                                                   dmax.date() if pd.notna(dmax) else date.today()))
+        dmin, dmax = pd.to_datetime(df["received_date"], errors="coerce").min(), pd.to_datetime(df["received_date"], errors="coerce").max()
+        d_from, d_to = st.sidebar.date_input(
+            "Date range",
+            value=(dmin.date() if pd.notna(dmin) else date.today(),
+                   dmax.date() if pd.notna(dmax) else date.today()),
+            key=f"{key_prefix}_date",
+        )
         filters["date"] = (pd.to_datetime(d_from), pd.to_datetime(d_to))
     if "supplier" in df.columns:
         sups = sorted([s for s in df["supplier"].dropna().unique().tolist()])
-        sel = st.sidebar.multiselect("Supplier", sups, default=sups)
+        sel = st.sidebar.multiselect("Supplier", sups, default=sups, key=f"{key_prefix}_supplier")
         filters["supplier"] = sel
     if "sku" in df.columns:
         skus = sorted([s for s in df["sku"].dropna().unique().tolist()])
-        sel = st.sidebar.multiselect("SKU", skus, default=skus)
+        sel = st.sidebar.multiselect("SKU", skus, default=skus, key=f"{key_prefix}_sku")
         filters["sku"] = sel
     return filters
-
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     ctx = df.copy()
     if "date" in filters and "received_date" in ctx.columns:
         d_from, d_to = filters["date"]
-        ctx = ctx[(pd.to_datetime(ctx["received_date"]) >= d_from) & (pd.to_datetime(ctx["received_date"]) <= d_to)]
-    if "supplier" in filters and "supplier" in ctx.columns:
+        ctx = ctx[(pd.to_datetime(ctx["received_date"], errors="coerce") >= d_from) &
+                  (pd.to_datetime(ctx["received_date"], errors="coerce") <= d_to)]
+    if "supplier" in filters and "supplier" in ctx.columns and filters.get("supplier"):
         ctx = ctx[ctx["supplier"].isin(filters["supplier"])]
-    if "sku" in filters and "sku" in ctx.columns:
+    if "sku" in filters and "sku" in ctx.columns and filters.get("sku"):
         ctx = ctx[ctx["sku"].isin(filters["sku"])]
     return ctx
 
-
 def kpi_cards(domain: str, df: pd.DataFrame, kpis: list[str]):
-    c1,c2,c3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
     # Simple demo measures; extend with your domain logic
     if len(kpis) >= 1:
         if "on_time" in df.columns:
@@ -373,6 +367,10 @@ def kpi_cards(domain: str, df: pd.DataFrame, kpis: list[str]):
             c1.metric(kpis[0], f"{v:.1%}")
         elif "ppv_amt" in df.columns:
             c1.metric(kpis[0], f"${df['ppv_amt'].sum():,.0f}")
+        elif "closing_qty" in df.columns:
+            c1.metric(kpis[0], f"{df['closing_qty'].sum():,.0f}")
+        elif "freight_cost" in df.columns:
+            c1.metric(kpis[0], f"${df['freight_cost'].sum():,.0f}")
         else:
             c1.metric(kpis[0], "–")
     if len(kpis) >= 2:
@@ -380,16 +378,22 @@ def kpi_cards(domain: str, df: pd.DataFrame, kpis: list[str]):
             c2.metric(kpis[1], f"${df['ppv_amt'].sum():,.0f}")
         elif "qty" in df.columns:
             c2.metric(kpis[1], f"{df['qty'].sum():,.0f}")
+        elif "closing_qty" in df.columns:
+            c2.metric(kpis[1], f"{df['closing_qty'].mean():,.0f}")
+        elif "freight_cost" in df.columns and "weight_kg" in df.columns:
+            per_unit = (df["freight_cost"].sum() / df["weight_kg"].sum()) if df["weight_kg"].sum() else 0
+            c2.metric(kpis[1], f"${per_unit:,.2f} / kg")
         else:
             c2.metric(kpis[1], "–")
     if len(kpis) >= 3:
-        if "act_cost" in df.columns and "qty" in df.columns:
-            total = (df["act_cost"]*df["qty"]).sum()
-            qty = df["qty"].sum() or 1
+        if "act_cost" in df.columns and "qty" in df.columns and df["qty"].sum():
+            total = (pd.to_numeric(df["act_cost"], errors="coerce") * pd.to_numeric(df["qty"], errors="coerce")).sum()
+            qty = pd.to_numeric(df["qty"], errors="coerce").sum() or 1
             c3.metric(kpis[2], f"${total/qty:,.2f}")
+        elif "complete_flag" in df.columns:
+            c3.metric(kpis[2], f"{df['complete_flag'].mean():.1%}")
         else:
             c3.metric(kpis[2], "–")
-
 
 def dashboard_section(title: str, client_id: int, domain: str):
     st.subheader(title)
@@ -398,54 +402,99 @@ def dashboard_section(title: str, client_id: int, domain: str):
         st.info("Dashboard is being prepared. Data not available yet.")
         return
 
-    # ensure a few helper columns for demo visuals
-    if "ppv_amt" not in df.columns and set(["std_cost","act_cost","qty"]).issubset(df.columns):
-        df["ppv_amt"] = (pd.to_numeric(df["act_cost"], errors='coerce') - pd.to_numeric(df["std_cost"], errors='coerce')) * pd.to_numeric(df["qty"], errors='coerce')
-    if "on_time" not in df.columns and set(["received_date","promised_date"]).issubset(df.columns):
-        rd = pd.to_datetime(df["received_date"], errors='coerce')
-        pdm = pd.to_datetime(df["promised_date"], errors='coerce')
+    # Compute helper fields for procurement if present
+    if "ppv_amt" not in df.columns and set(["std_cost", "act_cost", "qty"]).issubset(df.columns):
+        df["ppv_amt"] = (
+            pd.to_numeric(df["act_cost"], errors="coerce")
+            - pd.to_numeric(df["std_cost"], errors="coerce")
+        ) * pd.to_numeric(df["qty"], errors="coerce")
+    if "on_time" not in df.columns and set(["received_date", "promised_date"]).issubset(df.columns):
+        rd = pd.to_datetime(df["received_date"], errors="coerce")
+        pdm = pd.to_datetime(df["promised_date"], errors="coerce")
         df["on_time"] = (rd <= pdm).astype(int)
 
     kpis = load_kpis(client_id, domain)
 
-    # Print button (JS window.print)
+    # Print button (unique key)
     st.markdown("<div class='print-button'>", unsafe_allow_html=True)
-    st.button("🖨️ Print Dashboard", on_click=lambda: st.write(""))
+    st.button("🖨️ Print Dashboard", key=f"print_{domain}_{client_id}")
     st.markdown(
         """
         <script>
         const btns = window.parent.document.querySelectorAll('button');
-        btns.forEach(b => { if (b.innerText.includes('Print Dashboard')) { b.onclick = () => window.print(); }});
+        btns.forEach(b => { if (b.innerText && b.innerText.includes('Print Dashboard')) { b.onclick = () => window.print(); }});
         </script>
-        """, unsafe_allow_html=True
+        """,
+        unsafe_allow_html=True
     )
 
-    filters = slicers(df)
+    filters = slicers(df, key_prefix=f"{domain}_{client_id}")
     ctx = apply_filters(df, filters)
-
     kpi_cards(domain, ctx, kpis)
 
-    # Chart row
     c1, c2 = st.columns(2)
-    with c1:
-        if "received_date" in ctx.columns and "on_time" in ctx.columns:
-            ctx["month"] = pd.to_datetime(ctx["received_date"], errors='coerce').dt.to_period("M").dt.to_timestamp()
-            chart_df = ctx.groupby("month", as_index=False).agg(otd=("on_time","mean"))
-            fig = px.line(chart_df, x="month", y="otd", markers=True, title="On-Time Delivery by Month")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Add received_date & on_time columns for OTD chart.")
-    with c2:
-        if "supplier" in ctx.columns and "ppv_amt" in ctx.columns:
-            top = ctx.groupby("supplier", as_index=False)["ppv_amt"].sum().sort_values("ppv_amt", ascending=False)
-            fig2 = px.bar(top.head(10), x="supplier", y="ppv_amt", title="Top Suppliers by PPV")
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("Add supplier & ppv_amt columns for PPV chart.")
+
+    # ----- Procurement charts -----
+    if domain == "procurement":
+        with c1:
+            if {"received_date", "on_time"} <= set(ctx.columns):
+                ctx["month"] = pd.to_datetime(ctx["received_date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                chart_df = ctx.groupby("month", as_index=False).agg(otd=("on_time", "mean"))
+                fig = px.line(chart_df, x="month", y="otd", markers=True, title="On-Time Delivery by Month")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Add received_date & on_time columns for OTD chart.")
+        with c2:
+            if {"supplier", "ppv_amt"} <= set(ctx.columns):
+                top = ctx.groupby("supplier", as_index=False)["ppv_amt"].sum().sort_values("ppv_amt", ascending=False)
+                fig2 = px.bar(top.head(10), x="supplier", y="ppv_amt", title="Top Suppliers by PPV")
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Add supplier & ppv_amt columns for PPV chart.")
+
+    # ----- Inventory charts -----
+    elif domain == "inventory":
+        with c1:
+            if "month" in ctx.columns and "closing_qty" in ctx.columns:
+                df_plot = ctx.groupby("month", as_index=False)["closing_qty"].sum()
+                fig = px.line(df_plot, x="month", y="closing_qty", title="Closing Quantity Trend", markers=True)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Add month & closing_qty columns for trend chart.")
+        with c2:
+            if "category" in ctx.columns and "closing_qty" in ctx.columns:
+                fig2 = px.pie(ctx, names="category", values="closing_qty", title="Category Mix")
+                st.plotly_chart(fig2, use_container_width=True)
+            elif "warehouse" in ctx.columns and "closing_qty" in ctx.columns:
+                wh = ctx.groupby("warehouse", as_index=False)["closing_qty"].sum()
+                fig2 = px.bar(wh, x="warehouse", y="closing_qty", title="Warehouse Stock")
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Add category or warehouse columns for mix chart.")
+
+    # ----- Logistics charts -----
+    elif domain == "logistics":
+        with c1:
+            if {"dispatch_date", "freight_cost"} <= set(ctx.columns):
+                ctx["month"] = pd.to_datetime(ctx["dispatch_date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                df_plot = ctx.groupby("month", as_index=False)["freight_cost"].mean()
+                fig = px.line(df_plot, x="month", y="freight_cost", title="Freight Cost Trend", markers=True)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Add dispatch_date & freight_cost columns for trend chart.")
+        with c2:
+            if "mode" in ctx.columns:
+                fig2 = px.pie(ctx, names="mode", title="Mode Split (Air/Sea/Ground)")
+                st.plotly_chart(fig2, use_container_width=True)
+            elif "carrier" in ctx.columns:
+                perf = ctx.groupby("carrier", as_index=False)[["damage_flag", "complete_flag"]].mean(numeric_only=True)
+                fig2 = px.bar(perf, x="carrier", y="complete_flag", title="Carrier Perfect Delivery %")
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Add mode or carrier columns for logistics chart.")
 
     st.markdown("### Detail Table (Filtered)")
     st.dataframe(ctx, use_container_width=True)
-
 
 def page_client_home():
     set_bg("client")
@@ -469,9 +518,7 @@ def page_client_home():
     with tabs[2]:
         dashboard_section("Logistics Dashboard", cid, "logistics")
 
-
 # ----------------------------- Admin Area -----------------------------
-
 def page_admin_home():
     set_bg("admin")
     logout_button()
@@ -482,12 +529,11 @@ def page_admin_home():
         nav("login"); st.rerun()
 
     st.markdown("# Admin")
-    opt = st.radio("Go to:", ["Dashboards", "Backend"], horizontal=True)
+    opt = st.radio("Go to:", ["Dashboards", "Backend"], horizontal=True, key="admin_nav")
     if opt == "Dashboards":
         admin_dashboards()
     else:
         admin_backend()
-
 
 def admin_dashboards():
     st.markdown("### View Client Dashboards")
@@ -495,7 +541,8 @@ def admin_dashboards():
     if not clients:
         st.info("No clients yet.")
         return
-    cid = st.selectbox("Select Client", options=[c[0] for c in clients], format_func=lambda x: dict(clients).get(x))
+    cid = st.selectbox("Select Client", options=[c[0] for c in clients], format_func=lambda x: dict(clients).get(x),
+                       key="admin_dash_client_select")
     tabs = st.tabs(["Procurement", "Inventory", "Logistics"])
     with tabs[0]:
         dashboard_section("Procurement Dashboard", cid, "procurement")
@@ -503,7 +550,6 @@ def admin_dashboards():
         dashboard_section("Inventory Dashboard", cid, "inventory")
     with tabs[2]:
         dashboard_section("Logistics Dashboard", cid, "logistics")
-
 
 def admin_backend():
     st.markdown("### Backend")
@@ -514,19 +560,22 @@ def admin_backend():
         st.subheader("Create or Edit Client")
         c_left, c_right = st.columns(2)
         with c_left:
-            cname = st.text_input("Client Name")
-            cnotes = st.text_area("Background notes (optional)")
-            if st.button("Save Client"):
+            cname = st.text_input("Client Name", key="bk_client_name")
+            cnotes = st.text_area("Background notes (optional)", key="bk_client_notes")
+            if st.button("Save Client", key="save_client_main"):
                 cid = upsert_client(cname, cnotes)
-                st.success(f"Saved client '{cname}' (id={cid}). Redirecting to Step 2…")
-                st.session_state["last_client_id"] = cid
-                st.experimental_set_query_params(page="admin_home", step="data", cid=str(cid))
-                st.rerun()
+                if cid:
+                    st.success(f"Saved client '{cname}' (id={cid}). Redirecting to Step 2…")
+                    st.session_state["last_client_id"] = cid
+                    st.query_params.update({"page": "admin_home", "step": "data", "cid": str(cid)})
+                    st.rerun()
+                else:
+                    st.error("Please enter a valid client name.")
         with c_right:
             st.markdown("**Existing Clients**")
             cl = list_clients()
             if cl:
-                st.table(pd.DataFrame(cl, columns=["ID","Name"]))
+                st.table(pd.DataFrame(cl, columns=["ID", "Name"]))
             else:
                 st.info("No clients yet.")
 
@@ -536,9 +585,9 @@ def admin_backend():
         clients = list_clients()
         cid = st.selectbox("Client", options=[c[0] for c in clients] if clients else [None],
                            format_func=lambda x: dict(clients).get(x, "—") if x else "—",
-                           index=0 if clients else 0)
-        domain = st.selectbox("Domain", ["procurement","inventory","logistics"])
-        up = st.file_uploader("Upload CSV/Excel", type=["csv","xlsx","xls"])
+                           index=0 if clients else 0, key="bk_data_client")
+        domain = st.selectbox("Domain", ["procurement", "inventory", "logistics"], key="bk_data_domain")
+        up = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx", "xls"], key="bk_data_uploader")
 
         if up:
             if up.name.endswith(".csv"):
@@ -548,10 +597,13 @@ def admin_backend():
             # Basic cleaning: trim cols, lower snake case
             df.columns = (df.columns.astype(str).str.strip().str.lower().str.replace(" ", "_"))
             # coerce common fields
-            for c in ["received_date","promised_date","eta","date"]:
+            for c in ["received_date", "promised_date", "eta", "date", "dispatch_date", "delivery_date", "month"]:
                 if c in df.columns:
+                    # month might be YYYY-MM text; keep as is if so
+                    if c == "month":
+                        continue
                     df[c] = pd.to_datetime(df[c], errors='coerce')
-            for c in ["qty","quantity","act_cost","std_cost","price"]:
+            for c in ["qty", "quantity", "act_cost", "std_cost", "price", "closing_qty", "opening_qty", "receipts", "issues", "freight_cost", "weight_kg"]:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors='coerce')
 
@@ -562,16 +614,17 @@ def admin_backend():
                 st.dataframe(issues, use_container_width=True)
 
             st.markdown("#### Review / Edit Data")
-            edited = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+            edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", key=f"bk_editor_{cid}_{domain}")
 
-            if st.button("💾 Save Cleaned Data"):
+            if st.button("💾 Save Cleaned Data", key=f"save_data_{cid}_{domain}"):
                 if not cid:
                     st.error("Select a client first.")
                 else:
                     save_dataset(cid, domain, edited)
                     st.success("Data saved.")
                     st.info("Proceed to Step 3 to select KPIs.")
-                    st.experimental_set_query_params(page="admin_home", step="kpis", cid=str(cid), domain=domain)
+                    st.query_params.update({"page": "admin_home", "step": "kpis", "cid": str(cid), "domain": domain})
+
         else:
             st.info("Upload a CSV/Excel to begin cleaning.")
 
@@ -582,23 +635,22 @@ def admin_backend():
         cid = st.selectbox("Client", options=[c[0] for c in clients] if clients else [None],
                            format_func=lambda x: dict(clients).get(x, "—") if x else "—",
                            key="kpi_client")
-        for domain in ["procurement","inventory","logistics"]:
-            with st.expander(f"KPIs for {domain.title()}"):
-                chosen = st.multiselect("Choose KPIs", options=DEFAULT_KPIS[domain], default=load_kpis(cid, domain) if cid else DEFAULT_KPIS[domain], key=f"kpi_{domain}")
-                if st.button(f"Save {domain.title()} KPIs", key=f"save_{domain}"):
+        for dmn in ["procurement", "inventory", "logistics"]:
+            with st.expander(f"KPIs for {dmn.title()}"):
+                defaults = load_kpis(cid, dmn) if cid else DEFAULT_KPIS[dmn]
+                chosen = st.multiselect("Choose KPIs", options=DEFAULT_KPIS[dmn], default=defaults, key=f"kpi_{dmn}")
+                if st.button(f"Save {dmn.title()} KPIs", key=f"save_{dmn}_kpis"):
                     if cid:
-                        save_kpis(cid, domain, chosen)
-                        st.success(f"Saved KPIs for {domain}.")
+                        save_kpis(cid, dmn, chosen)
+                        st.success(f"Saved KPIs for {dmn}.")
                     else:
                         st.error("Select a client first.")
 
-
 # ----------------------------- Router -----------------------------
-
 def router():
     init_db()
-    q = st.experimental_get_query_params()
-    page = q.get("page", [None])[0] or st.session_state.get("page") or "landing"
+    # Read from URL first, then session, then default
+    page = st.query_params.get("page", st.session_state.get("page", "landing"))
     st.session_state["page"] = page
 
     if page == "landing":
@@ -611,7 +663,6 @@ def router():
         page_admin_home()
     else:
         page_landing()
-
 
 if __name__ == "__main__":
     router()
