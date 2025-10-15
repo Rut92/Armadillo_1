@@ -1,4 +1,4 @@
-# armadillo_app.py — Clean full script (syntax-checked)
+# armadillo_app.py — Full script
 # ---------------------------------------------------------------
 # Features
 # - Landing page (name + tagline centered), About/Services/Contact sections
@@ -69,7 +69,7 @@ DB_PATH = os.environ.get("ARMADILLO_DB", "armadillo.db")
 engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
 
 DEFAULT_KPIS = {
-    "procurement": ["Supplier OTD %", "PPV $", "PO Cycle Time (days)"],
+    "procurement": ["Supplier OTD %", "PPV $", "PO Cycle Time (days)", "Monthly Spend (Last Month)"],
     "inventory": ["Inventory Turns", "DOH", "Obsolete %"],
     "logistics": ["Perfect Order %", "Freight/Unit", "On-Time Ship %"],
 }
@@ -326,7 +326,7 @@ def slicers_sidebar(df: pd.DataFrame, key_prefix: str = "global") -> dict:
     st.sidebar.header("Filters")
     filters: dict = {}
 
-    # Date expander (uses received_date where available)
+    # Date expander (auto-picks a date column)
     with st.sidebar.expander("Date", expanded=True):
         date_col = None
         for candidate in ["received_date", "dispatch_date", "delivery_date", "month", "order_date"]:
@@ -392,11 +392,10 @@ def kpi_cards(domain: str, df: pd.DataFrame, kpis: list) -> None:
     vals: list[tuple[str, str]] = []
     for k in (kpis or [])[:3]:
         if isinstance(k, dict) and k.get("type") == "measure":
-            # (Very) simple measure renderer: evaluate agg-style expressions
+            # Simple measure renderer (sum/mean/count)
             expr = (k.get("expr") or "").strip()
             name = k.get("name") or "Measure"
             try:
-                # basic safe scope: sums / means
                 scope = {col: pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series(dtype=float)
                          for col in df.columns}
                 scope.update({
@@ -405,10 +404,7 @@ def kpi_cards(domain: str, df: pd.DataFrame, kpis: list) -> None:
                     "count": lambda x: int(pd.to_numeric(x, errors="coerce").count()),
                 })
                 val = eval(expr, {"__builtins__": {}}, scope)
-                if isinstance(val, float):
-                    vals.append((name, f"{val:,.2f}"))
-                else:
-                    vals.append((name, str(val)))
+                vals.append((name, f"{val:,.2f}" if isinstance(val, float) else str(val)))
             except Exception:
                 vals.append((name, "—"))
         elif isinstance(k, dict):
@@ -434,6 +430,20 @@ def kpi_cards(domain: str, df: pd.DataFrame, kpis: list) -> None:
                 vals.append((name, f"${per:,.2f}/kg"))
             elif "closing" in low and "closing_qty" in df.columns:
                 vals.append((name, f"{df['closing_qty'].sum():,.0f}"))
+            elif "monthly spend" in low and "total_spend" in df.columns:
+                # Last full month logic
+                date_col = "received_date" if "received_date" in df.columns else ("order_date" if "order_date" in df.columns else None)
+                if date_col:
+                    d = pd.to_datetime(df[date_col], errors="coerce")
+                    tmp = df.copy(); tmp["month"] = d.dt.to_period("M").dt.to_timestamp()
+                    monthly = tmp.groupby("month", as_index=False)["total_spend"].sum().sort_values("month")
+                    today = pd.Timestamp("today").normalize()
+                    this_month_start = today.replace(day=1)
+                    last_full_month = (this_month_start - pd.offsets.MonthBegin(1))
+                    last_val = monthly.loc[monthly["month"] == last_full_month, "total_spend"]
+                    vals.append((name, f"${float(last_val.iloc[0]):,.0f}" if not last_val.empty else "—"))
+                else:
+                    vals.append((name, "—"))
             else:
                 vals.append((name, "–"))
 
@@ -566,6 +576,16 @@ def export_pdf_for_dashboard(client_id: int, domain: str, ctx: pd.DataFrame, kpi
             figs.append(px.bar(top, x="supplier", y="ppv_amt",
                                title="Top Suppliers by PPV",
                                labels={"supplier":"Supplier","ppv_amt":"PPV Amount ($)"}))
+        # Monthly Spend chart
+        if domain == "procurement" and "total_spend" in ctx.columns:
+            date_col = "received_date" if "received_date" in ctx.columns else ("order_date" if "order_date" in ctx.columns else None)
+            if date_col:
+                tmp = ctx.copy()
+                tmp["month"] = pd.to_datetime(tmp[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                spend = tmp.groupby("month", as_index=False)["total_spend"].sum()
+                figs.append(px.bar(spend, x="month", y="total_spend",
+                                   title="Monthly Spend",
+                                   labels={"month":"Month","total_spend":"Total Spend ($)"}))
 
         if domain == "inventory" and {"month","closing_qty"} <= set(ctx.columns):
             df_plot = ctx.groupby("month", as_index=False)["closing_qty"].sum()
@@ -643,6 +663,9 @@ def dashboard_section(title: str, client_id: int, domain: str) -> None:
         return
 
     # helper cols for procurement
+    if domain == "procurement":
+        if "total_spend" not in df.columns and {"act_cost", "qty"} <= set(df.columns):
+            df["total_spend"] = pd.to_numeric(df["act_cost"], errors="coerce") * pd.to_numeric(df["qty"], errors="coerce")
     if "ppv_amt" not in df.columns and {"std_cost", "act_cost", "qty"} <= set(df.columns):
         df["ppv_amt"] = (
             pd.to_numeric(df["act_cost"], errors="coerce") - pd.to_numeric(df["std_cost"], errors="coerce")
@@ -700,6 +723,20 @@ def dashboard_section(title: str, client_id: int, domain: str) -> None:
                     use_container_width=True)
             else:
                 st.info("Add supplier & ppv_amt columns for PPV chart.")
+
+        # Monthly Spend chart
+        with st.container():
+            if "total_spend" in ctx.columns:
+                date_col = "received_date" if "received_date" in ctx.columns else ("order_date" if "order_date" in ctx.columns else None)
+                if date_col is not None:
+                    ctx["month"] = pd.to_datetime(ctx[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                    spend = ctx.groupby("month", as_index=False)["total_spend"].sum()
+                    st.plotly_chart(
+                        px.bar(spend, x="month", y="total_spend",
+                               title="Monthly Spend",
+                               labels={"month":"Month","total_spend":"Total Spend ($)"}),
+                        use_container_width=True
+                    )
 
     elif domain == "inventory":
         with c1:
@@ -869,10 +906,10 @@ def admin_backend() -> None:
         if up:
             df = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up)
             df.columns = df.columns.astype(str).str.strip().str.lower().str.replace(" ", "_")
-            for c in ["received_date", "promised_date", "eta", "date", "dispatch_date", "delivery_date", "month"]:
+            for c in ["received_date", "promised_date", "eta", "date", "dispatch_date", "delivery_date", "month", "order_date"]:
                 if c in df.columns and c != "month":
                     df[c] = pd.to_datetime(df[c], errors='coerce')
-            for c in ["qty", "quantity", "act_cost", "std_cost", "price", "closing_qty", "opening_qty", "receipts", "issues", "freight_cost", "weight_kg"]:
+            for c in ["qty", "quantity", "act_cost", "std_cost", "price", "closing_qty", "opening_qty", "receipts", "issues", "freight_cost", "weight_kg", "total_spend"]:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors='coerce')
 
@@ -929,9 +966,34 @@ def admin_backend() -> None:
             defaults = load_kpis(cid3, domain_key) if cid3 else DEFAULT_KPIS[domain_key]
             base = [k for k in defaults if isinstance(k, str)]
             custom_existing = [k for k in defaults if isinstance(k, dict)]
-            chosen = st.multiselect("Choose KPIs", options=DEFAULT_KPIS[domain_key], default=base, key=f"kpi_{domain_key}")
+            chosen = st.multiselect(
+                "Choose KPIs",
+                options=DEFAULT_KPIS[domain_key],
+                default=base,
+                key=f"kpi_{domain_key}"
+            )
+
+            # Add Custom KPI (column + aggregation)
+            st.markdown("**Add Custom KPI**")
+            data = load_dataset(cid3, domain_key) if cid3 else None
+            numeric_cols = [c for c in (data.columns.tolist() if data is not None else []) if (data is not None and pd.api.types.is_numeric_dtype(data[c]))]
+            ck1, ck2, ck3 = st.columns([2, 2, 1])
+            with ck1:
+                kpi_name = st.text_input("KPI Name", key=f"custom_name_{domain_key}")
+            with ck2:
+                kpi_col = st.selectbox("Column", options=numeric_cols, key=f"custom_col_{domain_key}")
+            with ck3:
+                kpi_agg = st.selectbox("Aggregation", options=["sum", "mean", "min", "max", "count"], key=f"custom_agg_{domain_key}")
+
+            if st.button(f"➕ Add Custom KPI", key=f"add_custom_{domain_key}"):
+                if kpi_name and kpi_col:
+                    custom_existing.append({"name": kpi_name, "column": kpi_col, "agg": kpi_agg})
+                    st.success("Custom KPI added (remember to Save KPIs).")
+                else:
+                    st.error("Provide a name and select a column.")
 
             # Calculated columns (formula)
+
             st.markdown("#### Calculated Columns")
             cc1, cc2 = st.columns([2,3])
             with cc1:
@@ -955,7 +1017,7 @@ def admin_backend() -> None:
             with m1:
                 m_name = st.text_input("Measure name", key=f"meas_name_{domain_key}")
             with m2:
-                m_expr = st.text_input("Measure formula (e.g., sum(ppv_amt)/sum(qty))", key=f"meas_expr_{domain_key}")
+                m_expr = st.text_input("Measure formula (e.g., sum(total_spend))", key=f"meas_expr_{domain_key}")
             with m3:
                 st.markdown("&nbsp;")
                 if st.button("Add Measure", key=f"add_meas_{domain_key}"):
@@ -978,6 +1040,8 @@ def admin_backend() -> None:
             kpi_builder("logistics")
 
 
+# ----------------------------- Routered Pages -----------------------------
+
 def page_admin_home() -> None:
     set_bg("admin")
     logout_button()
@@ -993,6 +1057,34 @@ def page_admin_home() -> None:
         admin_dashboards()
     else:
         admin_backend()
+
+
+def page_client_home() -> None:
+    set_bg("client")
+    logout_button()
+
+    user = st.session_state.get("auth", {}).get("user")
+    if not user:
+        st.warning("Please login.")
+        nav("login"); st.rerun()
+    cid = user.get("client_id")
+    if not cid:
+        st.info("No client linked to this account yet.")
+        return
+
+    # Show client name
+    with engine.begin() as con:
+        row = con.execute(text("SELECT name FROM clients WHERE id=:i"), {"i": cid}).fetchone()
+    cname = row[0] if row else "Client"
+    st.markdown(f"## {cname} — Dashboards")
+
+    tabs = st.tabs(["Procurement", "Inventory", "Logistics"])
+    with tabs[0]:
+        dashboard_section("Procurement Dashboard", cid, "procurement")
+    with tabs[1]:
+        dashboard_section("Inventory Dashboard", cid, "inventory")
+    with tabs[2]:
+        dashboard_section("Logistics Dashboard", cid, "logistics")
 
 # ----------------------------- Router -----------------------------
 
