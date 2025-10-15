@@ -1,4 +1,4 @@
-# armadillo_app.py — Full script
+# armadillo_app.py — Full script (with KPI Catalog, MoM charts, robust Monthly Spend KPI)
 # ---------------------------------------------------------------
 # Features
 # - Landing page (name + tagline centered), About/Services/Contact sections
@@ -12,6 +12,7 @@
 #         - Calculated columns (formula builder)
 #         - Measures (expression builder)
 #         - Data preview for each domain
+#         - NEW: KPI Catalog (dropdown) with description + formula text + appendable calcs
 # - SQLite persistence; bcrypt password hashing
 # - Client view hides tables (toggle to view); Admin sees table by default
 # - Uses only st.query_params (no experimental APIs)
@@ -72,6 +73,116 @@ DEFAULT_KPIS = {
     "procurement": ["Supplier OTD %", "PPV $", "PO Cycle Time (days)", "Monthly Spend (Last Month)"],
     "inventory": ["Inventory Turns", "DOH", "Obsolete %"],
     "logistics": ["Perfect Order %", "Freight/Unit", "On-Time Ship %"],
+}
+
+# ----------------------------- KPI Catalog (name, description, formula hints) -----------------------------
+# These are *display* KPIs and/or visuals. Some include an "appendable" calc you can apply to the dataset.
+KPI_CATALOG = {
+    "procurement": [
+        {
+            "name": "Monthly Spend (Last Month)",
+            "desc": "Sum of total_spend for the last full month.",
+            "formula_text": "sum(total_spend) filtered to last full calendar month",
+            "appendable_calc": None
+        },
+        {
+            "name": "Spend by Supplier (MoM)",
+            "desc": "Visualization: Stacked bar of total_spend by supplier per month.",
+            "formula_text": "groupby(month, supplier).sum(total_spend)",
+            "appendable_calc": None
+        },
+        {
+            "name": "Spend by Category (MoM)",
+            "desc": "Visualization: Stacked bar of total_spend by category per month.",
+            "formula_text": "groupby(month, category).sum(total_spend)",
+            "appendable_calc": None
+        },
+        {
+            "name": "Spend by Region (MoM)",
+            "desc": "Visualization: Stacked bar of total_spend by region per month.",
+            "formula_text": "groupby(month, region).sum(total_spend)",
+            "appendable_calc": None
+        },
+        {
+            "name": "On-Time Delivery %",
+            "desc": "Supplier performance (delivery punctuality).",
+            "formula_text": "mean(on_time) where on_time ∈ {0,1}",
+            "appendable_calc": {
+                "id": "on_time_flag",
+                "needs": ["received_date", "promised_date"],
+                "creates": "on_time",
+                "expr_kind": "python",  # handled in code: (received_date <= promised_date).astype(int)
+            }
+        },
+        {
+            "name": "Procurement Cycle Time (days)",
+            "desc": "Avg days from order_date to received_date (fallback to promised_date).",
+            "formula_text": "mean((received_date - order_date).days)",
+            "appendable_calc": {
+                "id": "cycle_time_days",
+                "needs": ["order_date"],
+                "creates": "cycle_time_days",
+                "expr_kind": "python_ct",
+            }
+        },
+        {
+            "name": "Maverick Spend %",
+            "desc": "Off-contract spend share.",
+            "formula_text": "sum(total_spend where is_contract==0)/sum(total_spend)",
+            "appendable_calc": None
+        },
+        {
+            "name": "Receiving Accuracy %",
+            "desc": "Accuracy of delivered vs ordered quantity.",
+            "formula_text": "mean(received_qty == ordered_qty)",
+            "appendable_calc": None
+        },
+        {
+            "name": "Contract Renewals (≤ 30 days)",
+            "desc": "Count of contracts expiring in next 30 days.",
+            "formula_text": "count(contract_renewal_date within next 30 days)",
+            "appendable_calc": None
+        },
+    ],
+    "inventory": [
+        {
+            "name": "Total Inventory Value",
+            "desc": "Sum of on-hand value.",
+            "formula_text": "sum(closing_qty * unit_cost)",
+            "appendable_calc": None
+        },
+        {
+            "name": "Days of Supply (DOS)",
+            "desc": "Closing stock coverage at current daily sales rate.",
+            "formula_text": "closing_qty / daily_sales (if >0 else ∞)",
+            "appendable_calc": None
+        },
+        {
+            "name": "Low Stock Alerts",
+            "desc": "Items with closing_qty ≤ reorder_point.",
+            "formula_text": "count(closing_qty <= reorder_point)",
+            "appendable_calc": None
+        },
+        {
+            "name": "Slow-Moving Inventory Count",
+            "desc": "Items with age ≥ threshold or sales velocity below threshold.",
+            "formula_text": "count(age_days>=X or velocity<=Y)",
+            "appendable_calc": None
+        },
+        {
+            "name": "Sell-through Rate %",
+            "desc": "Period sales effectiveness.",
+            "formula_text": "period_sales / (period_sales + ending_inventory) or period_sales / beginning_inventory",
+            "appendable_calc": None
+        },
+        {
+            "name": "Fill Rate %",
+            "desc": "Orders immediately fulfilled from stock.",
+            "formula_text": "immediately_filled_order_lines / total_order_lines",
+            "appendable_calc": None
+        },
+    ],
+    "logistics": []
 }
 
 # ----------------------------- DB Helpers -----------------------------
@@ -389,10 +500,30 @@ def kpi_cards(domain: str, df: pd.DataFrame, kpis: list) -> None:
             return float(d.dt.days.mean()) if len(_df) else 0
         return None
 
+    def last_full_month_value(_df: pd.DataFrame, amount_col: str = "total_spend"):
+        if amount_col not in _df.columns:
+            return None
+        date_col = None
+        for candidate in ["received_date", "order_date", "month"]:
+            if candidate in _df.columns:
+                date_col = candidate
+                break
+        if not date_col:
+            return None
+        d = pd.to_datetime(_df[date_col], errors="coerce")
+        tmp = _df.copy()
+        tmp["month"] = (d.dt.to_period("M").dt.to_timestamp() if date_col != "month"
+                        else pd.to_datetime(tmp["month"], errors="coerce").dt.to_period("M").dt.to_timestamp())
+        monthly = tmp.groupby("month", as_index=False)[amount_col].sum().sort_values("month")
+        today = pd.Timestamp("today").normalize()
+        this_month_start = today.replace(day=1)
+        last_full = (this_month_start - pd.offsets.MonthBegin(1))
+        row = monthly.loc[monthly["month"] == last_full, amount_col]
+        return float(row.iloc[0]) if not row.empty else None
+
     vals: list[tuple[str, str]] = []
     for k in (kpis or [])[:3]:
         if isinstance(k, dict) and k.get("type") == "measure":
-            # Simple measure renderer (sum/mean/count)
             expr = (k.get("expr") or "").strip()
             name = k.get("name") or "Measure"
             try:
@@ -422,28 +553,21 @@ def kpi_cards(domain: str, df: pd.DataFrame, kpis: list) -> None:
                 ct = cycle_time_days(df)
                 vals.append((name, f"{ct:.1f} days" if ct is not None else "–"))
             elif "ppv" in low and "ppv_amt" in df.columns:
-                vals.append((name, f"${df['ppv_amt'].sum():,.0f}"))
-            elif "otd" in low and "on_time" in df.columns:
-                vals.append((name, f"{df['on_time'].mean():.1%}"))
+                vals.append((name, f"${pd.to_numeric(df['ppv_amt'], errors='coerce').sum():,.0f}"))
+            elif ("otd" in low or "on-time delivery" in low) and "on_time" in df.columns:
+                vals.append((name, f"{pd.to_numeric(df['on_time'], errors='coerce').mean():.1%}"))
             elif "freight" in low and {"freight_cost", "weight_kg"} <= set(df.columns):
-                per = df["freight_cost"].sum() / df["weight_kg"].sum() if df["weight_kg"].sum() else 0
+                per = pd.to_numeric(df["freight_cost"], errors="coerce").sum() / max(pd.to_numeric(df["weight_kg"], errors="coerce").sum(), 1e-9)
                 vals.append((name, f"${per:,.2f}/kg"))
             elif "closing" in low and "closing_qty" in df.columns:
-                vals.append((name, f"{df['closing_qty'].sum():,.0f}"))
-            elif "monthly spend" in low and "total_spend" in df.columns:
-                # Last full month logic
-                date_col = "received_date" if "received_date" in df.columns else ("order_date" if "order_date" in df.columns else None)
-                if date_col:
-                    d = pd.to_datetime(df[date_col], errors="coerce")
-                    tmp = df.copy(); tmp["month"] = d.dt.to_period("M").dt.to_timestamp()
-                    monthly = tmp.groupby("month", as_index=False)["total_spend"].sum().sort_values("month")
-                    today = pd.Timestamp("today").normalize()
-                    this_month_start = today.replace(day=1)
-                    last_full_month = (this_month_start - pd.offsets.MonthBegin(1))
-                    last_val = monthly.loc[monthly["month"] == last_full_month, "total_spend"]
-                    vals.append((name, f"${float(last_val.iloc[0]):,.0f}" if not last_val.empty else "—"))
-                else:
-                    vals.append((name, "—"))
+                vals.append((name, f"{pd.to_numeric(df['closing_qty'], errors='coerce').sum():,.0f}"))
+            elif "monthly spend" in low:
+                # Ensure total_spend exists if act_cost & qty present
+                if "total_spend" not in df.columns and {"act_cost", "qty"} <= set(df.columns):
+                    df = df.copy()
+                    df["total_spend"] = pd.to_numeric(df["act_cost"], errors="coerce") * pd.to_numeric(df["qty"], errors="coerce")
+                val = last_full_month_value(df, "total_spend")
+                vals.append((name, f"${val:,.0f}" if val is not None else "—"))
             else:
                 vals.append((name, "–"))
 
@@ -558,7 +682,7 @@ def page_login() -> None:
 
 def export_pdf_for_dashboard(client_id: int, domain: str, ctx: pd.DataFrame, kpis: list) -> str:
     """
-    Builds a multi-chart PDF: KPIs + up to 2 domain charts.
+    Builds a multi-chart PDF: KPIs + up to domain charts.
     Requires: pip install kaleido reportlab
     """
     figs = []
@@ -585,6 +709,16 @@ def export_pdf_for_dashboard(client_id: int, domain: str, ctx: pd.DataFrame, kpi
                 spend = tmp.groupby("month", as_index=False)["total_spend"].sum()
                 figs.append(px.bar(spend, x="month", y="total_spend",
                                    title="Monthly Spend",
+                                   labels={"month":"Month","total_spend":"Total Spend ($)"}))
+        # NEW: MoM Spend by Supplier (stacked)
+        if domain == "procurement" and "total_spend" in ctx.columns:
+            date_c = "received_date" if "received_date" in ctx.columns else ("order_date" if "order_date" in ctx.columns else None)
+            if date_c and "supplier" in ctx.columns:
+                tmp = ctx.copy()
+                tmp["month"] = pd.to_datetime(tmp[date_c], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                spend_sup = tmp.groupby(["month", "supplier"], as_index=False)["total_spend"].sum()
+                figs.append(px.bar(spend_sup, x="month", y="total_spend", color="supplier",
+                                   title="MoM Spend by Supplier",
                                    labels={"month":"Month","total_spend":"Total Spend ($)"}))
 
         if domain == "inventory" and {"month","closing_qty"} <= set(ctx.columns):
@@ -724,16 +858,64 @@ def dashboard_section(title: str, client_id: int, domain: str) -> None:
             else:
                 st.info("Add supplier & ppv_amt columns for PPV chart.")
 
-        # Monthly Spend chart
+        # ===== Monthly Spend charts (includes Supplier/Category/Region stacked) =====
         with st.container():
-            if "total_spend" in ctx.columns:
-                date_col = "received_date" if "received_date" in ctx.columns else ("order_date" if "order_date" in ctx.columns else None)
-                if date_col is not None:
-                    ctx["month"] = pd.to_datetime(ctx[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
-                    spend = ctx.groupby("month", as_index=False)["total_spend"].sum()
+            # Ensure total_spend exists
+            if "total_spend" not in ctx.columns and {"act_cost", "qty"} <= set(ctx.columns):
+                ctx = ctx.copy()
+                ctx["total_spend"] = pd.to_numeric(ctx["act_cost"], errors="coerce") * pd.to_numeric(ctx["qty"], errors="coerce")
+
+            # Pick date column
+            date_col = None
+            for candidate in ["received_date", "order_date", "month"]:
+                if candidate in ctx.columns:
+                    date_col = candidate
+                    break
+
+            if date_col is None or "total_spend" not in ctx.columns:
+                st.info("Add received_date or order_date, and act_cost & qty (or total_spend) for Monthly Spend charts.")
+            else:
+                tmp = ctx.copy()
+                if date_col != "month":
+                    tmp["month"] = pd.to_datetime(tmp[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                else:
+                    tmp["month"] = pd.to_datetime(tmp["month"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+
+                # Baseline Monthly Spend (total)
+                spend_total = tmp.groupby("month", as_index=False)["total_spend"].sum()
+                st.plotly_chart(
+                    px.bar(spend_total, x="month", y="total_spend",
+                           title="Monthly Spend (Total)",
+                           labels={"month": "Month", "total_spend": "Total Spend ($)"}),
+                    use_container_width=True
+                )
+
+                # MoM Spend by Supplier (stacked)
+                if "supplier" in tmp.columns:
+                    spend_sup = tmp.groupby(["month", "supplier"], as_index=False)["total_spend"].sum()
                     st.plotly_chart(
-                        px.bar(spend, x="month", y="total_spend",
-                               title="Monthly Spend",
+                        px.bar(spend_sup, x="month", y="total_spend", color="supplier", barmode="stack",
+                               title="Month-over-Month Spend by Supplier",
+                               labels={"month":"Month","total_spend":"Total Spend ($)"}),
+                        use_container_width=True
+                    )
+
+                # MoM Spend by Category (stacked)
+                if "category" in tmp.columns and tmp["category"].notna().any():
+                    spend_cat = tmp.groupby(["month", "category"], as_index=False)["total_spend"].sum()
+                    st.plotly_chart(
+                        px.bar(spend_cat, x="month", y="total_spend", color="category", barmode="stack",
+                               title="Month-over-Month Spend by Category",
+                               labels={"month":"Month","total_spend":"Total Spend ($)"}),
+                        use_container_width=True
+                    )
+
+                # MoM Spend by Region (stacked)
+                if "region" in tmp.columns and tmp["region"].notna().any():
+                    spend_reg = tmp.groupby(["month", "region"], as_index=False)["total_spend"].sum()
+                    st.plotly_chart(
+                        px.bar(spend_reg, x="month", y="total_spend", color="region", barmode="stack",
+                               title="Month-over-Month Spend by Region",
                                labels={"month":"Month","total_spend":"Total Spend ($)"}),
                         use_container_width=True
                     )
@@ -943,7 +1125,7 @@ def admin_backend() -> None:
                     save_dataset(cid2, domain, edited2)
                     st.success("Existing data updated.")
 
-    # --- Step 3: KPI (per-domain subtabs, calculated columns, measures) ---
+    # --- Step 3: KPI (per-domain subtabs, calculated columns, measures, KPI Catalog) ---
     with t3:
         st.subheader("KPI")
         clients = list_clients()
@@ -952,6 +1134,37 @@ def admin_backend() -> None:
                             key="kpi_client")
 
         tab_p, tab_i, tab_l = st.tabs(["Procurement", "Inventory", "Logistics"])
+
+        def _append_calc_column(domain_key: str, data: pd.DataFrame, calc_def: dict) -> tuple[pd.DataFrame, str]:
+            """Attempt to append a calculated column based on a catalog entry; returns (df, message)."""
+            if not calc_def:
+                return data, "No calculated column to append."
+            needs = calc_def.get("needs", [])
+            creates = calc_def.get("creates")
+            kind = calc_def.get("expr_kind")
+
+            if not creates:
+                return data, "Nothing to create."
+            if any(n not in data.columns for n in needs):
+                return data, f"Missing required columns: {', '.join([n for n in needs if n not in data.columns])}"
+
+            df = data.copy()
+            # Known helpers
+            if creates == "on_time" and kind == "python":
+                rd = pd.to_datetime(df["received_date"], errors="coerce")
+                pdm = pd.to_datetime(df["promised_date"], errors="coerce")
+                df["on_time"] = (rd <= pdm).astype(int)
+                return df, "Appended 'on_time' (0/1) from received_date vs promised_date."
+
+            if creates == "cycle_time_days" and kind == "python_ct":
+                rd = pd.to_datetime(df.get("received_date", pd.NaT), errors="coerce")
+                od = pd.to_datetime(df.get("order_date", pd.NaT), errors="coerce")
+                pdm = pd.to_datetime(df.get("promised_date", pd.NaT), errors="coerce")
+                base = rd.where(rd.notna(), pdm)
+                df["cycle_time_days"] = (base - od).dt.days
+                return df, "Appended 'cycle_time_days' from timestamps."
+
+            return df, "No-op: Unrecognized calc kind."
 
         def kpi_builder(domain_key: str):
             st.markdown("#### Dataset Preview")
@@ -973,27 +1186,37 @@ def admin_backend() -> None:
                 key=f"kpi_{domain_key}"
             )
 
-            # Add Custom KPI (column + aggregation)
-            st.markdown("**Add Custom KPI**")
-            data = load_dataset(cid3, domain_key) if cid3 else None
-            numeric_cols = [c for c in (data.columns.tolist() if data is not None else []) if (data is not None and pd.api.types.is_numeric_dtype(data[c]))]
-            ck1, ck2, ck3 = st.columns([2, 2, 1])
-            with ck1:
-                kpi_name = st.text_input("KPI Name", key=f"custom_name_{domain_key}")
-            with ck2:
-                kpi_col = st.selectbox("Column", options=numeric_cols, key=f"custom_col_{domain_key}")
-            with ck3:
-                kpi_agg = st.selectbox("Aggregation", options=["sum", "mean", "min", "max", "count"], key=f"custom_agg_{domain_key}")
-
-            if st.button(f"➕ Add Custom KPI", key=f"add_custom_{domain_key}"):
-                if kpi_name and kpi_col:
-                    custom_existing.append({"name": kpi_name, "column": kpi_col, "agg": kpi_agg})
-                    st.success("Custom KPI added (remember to Save KPIs).")
-                else:
-                    st.error("Provide a name and select a column.")
+            # KPI Catalog: pick from curated list, see description + formula, and add/append
+            st.markdown("#### KPI Catalog (pick → view → add/append)")
+            catalog = KPI_CATALOG.get(domain_key, [])
+            kpi_names = [item["name"] for item in catalog]
+            sel = st.selectbox("Catalog KPI", options=["— Select —"] + kpi_names, key=f"catalog_sel_{domain_key}")
+            if sel and sel != "— Select —":
+                item = next((i for i in catalog if i["name"] == sel), None)
+                if item:
+                    st.write(f"**Description:** {item['desc']}")
+                    st.code(item["formula_text"], language="text")
+                    cc1, cc2 = st.columns([1,1])
+                    with cc1:
+                        if st.button("➕ Add as Display KPI", key=f"catalog_add_display_{domain_key}"):
+                            if item["name"] not in chosen:
+                                chosen.append(item["name"])
+                                st.success("Added to Display KPIs (remember to Save KPIs).")
+                            else:
+                                st.info("Already in Display KPIs.")
+                    with cc2:
+                        if item.get("appendable_calc"):
+                            if st.button("🧩 Append Calculated Column", key=f"catalog_append_calc_{domain_key}"):
+                                updated, msg = _append_calc_column(domain_key, data, item["appendable_calc"])
+                                if updated is not None and msg:
+                                    save_dataset(cid3, domain_key, updated)
+                                    st.success(msg + " Saved back to dataset.")
+                                else:
+                                    st.warning("Nothing changed.")
+                        else:
+                            st.caption("No calculated column to append for this KPI.")
 
             # Calculated columns (formula)
-
             st.markdown("#### Calculated Columns")
             cc1, cc2 = st.columns([2,3])
             with cc1:
